@@ -1,49 +1,126 @@
-from nuscenes.utils.data_classes import LidarPointCloud
 import torch
 from torch.utils.data import Dataset
 import numpy as np
 import matplotlib.pyplot as plt
-     
-def project_to_range_image(points, H=32, W=1024, f_up=10.708, f_down=-58.116): 
-    f_up = np.radians(f_up)
-    f_down = np.radians(f_down)
-    fov = abs(f_up) + abs(f_down)
-    
-    x, y, z, intensity = points[:, 0], points[:, 1], points[:, 2], points[:, 3]
-    depth = np.sqrt(x**2 + y**2 + z**2)
+import time
+import yaml
+import onnxruntime as ort
+import cv2 as cv
+#from classes import NuScenesLidarDataset
 
-    yaw = np.arctan2(y,x)
-    pitch = np.arcsin(z/(depth+1e-8))
+ # TODO: when you get SemanticKITTI installed, remember that their lidar uses
+ # 64 beams, change H to 64 when working with that.
+SEQ_DIR = 'semantickitti_seq08/dataset/sequences/08'
 
-    u = 0.5*(1-yaw/np.pi)*W
-    v = (1 -(pitch + abs(f_down))/fov)*H
-    
-    u = np.clip(u, 0, W - 1).astype(np.int32)
-    v = np.clip(v, 0, H - 1).astype(np.int32)
+arch = yaml.safe_load(open("lidar-bonnetal/darknet53/arch_cfg.yaml"))
+data = yaml.safe_load(open("lidar-bonnetal/darknet53/data_cfg.yaml"))
+s = arch["dataset"]["sensor"]
+H, W = s["img_prop"]["height"], s["img_prop"]["width"]
+fov_up, fov_down = np.radians(s["fov_up"]), np.radians(s["fov_down"])
+fov = abs(fov_up) + abs(fov_down)
+means = np.array(s["img_means"], np.float32)[:, None, None]
+stds = np.array(s["img_stds"], np.float32)[:, None, None]
 
-    range_image = np.full((H, W, 5), -1, dtype=np.float32)  # channels: range, x, y, z, intensity
-    range_image[v, u] = np.stack([depth, x, y, z, intensity], axis=1)
+lut = np.zeros(260, np.uint32)
+for k, val in data["learning_map_inv"].items():
+    lut[k] = val
 
-    print("unique row indices used:", np.unique(v).size, "out of", H)
-    return range_image
-    
-#nusc = ns(version='v1.0-mini', dataroot='nuscenes-mini/', verbose=True)
-pc = LidarPointCloud.from_file('nuscenes-mini/samples/LIDAR_TOP/n008-2018-08-01-15-16-36-0400__LIDAR_TOP__1533151616447606.pcd.bin')
-points = pc.points.T
+providers = [
+    ('CUDAExecutionProvider', {
+        'cudnn_conv_algo_search': 'DEFAULT',  # try this first; 'EXHAUSTIVE' is the fallback option
+    }),
+    'CPUExecutionProvider',
+]
 
-depth = np.sqrt(points[:,0]**2 + points[:,1]**2 + points[:,2]**2)
-pitch = np.arcsin(points[:,2] / (depth + 1e-8))
-print("pitch range (degrees):", np.degrees(pitch).min(), np.degrees(pitch).max())
+sess = ort.InferenceSession("model.onnx", providers=providers)
+input_name = sess.get_inputs()[0].name
+print("Providers in use:", sess.get_providers())
 
-range_image = project_to_range_image(points, f_up=np.degrees(pitch).max(), f_down=np.degrees(pitch).min())
+def load_kitti_bin(filepath):
+    scan = np.fromfile(filepath, dtype=np.float32)
+    return scan.reshape((-1, 4))
 
-plt.figure(figsize=(12, 3))
-plt.imshow(range_image[:, :, 0], cmap='viridis', aspect='auto')
-plt.colorbar(label='depth (m)')
-plt.title('Range Image')
-plt.xlabel('azimuth (u)')
-plt.ylabel('elevation (v)')
+def foveated_mask(points, near_r=10, far_r=100, keep_near=1.0, keep_far=0.1):
+    depth = np.linalg.norm(points[:, :3], axis=1)
+    frac = np.clip((depth - near_r) / (far_r - near_r), 0, 1)
+    keep_prob = keep_near - frac * (keep_near - keep_far)
+    return np.random.rand(len(points)) < keep_prob
+
+def preprocess(pts):
+    x, y, z, r = pts.T
+    depth = np.linalg.norm(pts[:, :3], axis=1)
+    yaw, pitch = -np.arctan2(y, x), np.arcsin(z / (depth + 1e-8))
+    u = np.clip(np.floor(0.5 * (yaw / np.pi + 1) * W), 0, W - 1).astype(int)
+    v = np.clip(np.floor((1 - (pitch + abs(fov_down)) / fov) * H), 0, H - 1).astype(int)
+    order = np.argsort(depth)[::-1]
+    img = np.full((5, H, W), -1, np.float32)
+    img[:, v[order], u[order]] = np.stack([depth, x, y, z, r])[:, order]
+    mask = img[0] > 0
+    img = (img - means) / stds
+    img *= mask
+    return img[None].astype(np.float32), u, v
+
+
+def load_class_image(idx):
+    points = load_kitti_bin(f'{SEQ_DIR}/velodyne/{idx:06d}.bin')
+    mask = foveated_mask(points)
+    points = points[mask]
+
+    inp, u, v = preprocess(points)
+
+    t0 = time.time()
+    probs = sess.run(None, {input_name: inp})[0]
+    infer_time = time.time() - t0
+
+    pred = probs[0].argmax(0)[v, u]
+    labels = lut[pred]
+
+    class_image = np.full((H, W), -1, dtype=np.int32)
+    class_image[v, u] = labels
+    return np.ma.masked_where(class_image < 0, class_image), infer_time
+
+
+# --- set up the plot once, using frame 0 ---
+fig, ax = plt.subplots(figsize=(14, 4))
+first_image, _ = load_class_image(0)
+img_display = ax.imshow(first_image, cmap='tab20')
+
+for idx in range(4071):
+    t0 = time.time()
+    points = load_kitti_bin(f'{SEQ_DIR}/velodyne/{idx:06d}.bin')
+    t1 = time.time()
+
+    # mask = foveated_mask(points)
+    # points = points[mask]
+    t2 = time.time()
+
+    inp, u, v = preprocess(points)
+    t3 = time.time()
+
+    probs = sess.run(None, {input_name: inp})[0]
+    t4 = time.time()
+
+    pred = probs[0].argmax(0)[v, u]
+    labels = lut[pred]
+    class_image = np.full((H, W), -1, dtype=np.int32)
+    class_image[v, u] = labels
+    t5 = time.time()
+
+    img_display.set_data(class_image)
+    ax.set_title(f'Frame {idx} | {1/(t4-t3):.1f} Hz (inference only)')
+    plt.pause(0.001)
+    t6 = time.time()
+
+    print(f"load={t1-t0:.3f} mask={t2-t1:.3f} preprocess={t3-t2:.3f} "
+          f"infer={t4-t3:.3f} postproc={t5-t4:.3f} plot={t6-t5:.3f}")
+    # class_image, infer_time = load_class_image(idx)
+
+    # img_display.set_data(class_image)
+    # ax.set_title(f'Frame {idx} | {1/infer_time:.1f} Hz (inference only)')
+    # plt.pause(0.001)
+
 plt.show()
+
 
 
 
